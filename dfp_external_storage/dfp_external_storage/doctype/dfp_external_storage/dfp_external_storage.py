@@ -395,9 +395,17 @@ class DFPExternalStorageFile(File):
 		original_file_url = self.file_url
 
 		# Define S3 key
-		# key = f"{frappe.local.site}/{self.file_name}" # << Before 2024.03.03
 		base, extension = os.path.splitext(self.file_name)
-		key = f"{frappe.local.site}/{base}-{self.name}{extension}"
+		if self.attached_to_doctype and self.attached_to_name:
+			try:
+				creation = frappe.db.get_value(self.attached_to_doctype, self.attached_to_name, "creation")
+				date_str = str(creation.date()) if creation else frappe.utils.today()
+			except Exception:
+				date_str = frappe.utils.today()
+			folder = f"{self.attached_to_doctype}/{self.attached_to_name}-{date_str}"
+			key = f"{frappe.local.site}/{folder}/{base}-{self.name}{extension}"
+		else:
+			key = f"{frappe.local.site}/{base}-{self.name}{extension}"
 
 		is_public = "/public" if not self.is_private else ""
 		if not local_file:
