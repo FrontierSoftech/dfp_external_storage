@@ -411,6 +411,7 @@ class DFPExternalStorageFile(File):
 		if not local_file:
 			local_file = "./" + frappe.local.site + is_public + self.file_url
 
+		uploaded_to_remote = False
 		try:
 			if not os.path.exists(local_file):
 				frappe.throw(_("Local file not found"))
@@ -423,24 +424,49 @@ class DFPExternalStorageFile(File):
 					# Meta removed because same s3 file can be used within different File docs
 					# metadata={"frappe_file_id": self.name}
 				)
+			uploaded_to_remote = True
 
 			self.dfp_external_storage_s3_key = key
 			self.dfp_external_storage = self.dfp_external_storage_doc.name
 			self.file_url = f"/{DFP_EXTERNAL_STORAGE_URL_SEGMENT_FOR_FILE_LOAD}/{self.name}/{self.file_name}"
-			os.remove(local_file)
+
+			# Delete local file only after the DB transaction commits successfully.
+			# If the transaction rolls back (e.g. duplicate hash, validation failure),
+			# the local file is preserved and the remote object is removed.
+			_local_file = local_file
+			def _delete_local_after_commit():
+				try:
+					if os.path.exists(_local_file):
+						os.remove(_local_file)
+				except Exception:
+					frappe.log_error(f"Failed to delete local file after remote upload: {_local_file}")
+
+			_bucket = self.dfp_external_storage_doc.bucket_name
+			_client = self.dfp_external_storage_client
+			_key = key
+			def _remove_remote_on_rollback():
+				try:
+					_client.remove_object(bucket_name=_bucket, object_name=_key)
+				except Exception:
+					frappe.log_error(f"Failed to remove remote file after DB rollback: {_key}")
+
+			frappe.db.after_commit.add(_delete_local_after_commit)
+			frappe.db.after_rollback.add(_remove_remote_on_rollback)
+
 		except Exception as e:
 			error_msg = _("Error saving file in remote folder: {}").format(str(e))
 			frappe.log_error(f"{error_msg}: {self.file_name}", message=e)
-			# If file is new we upload to local filesystem
-			if not self.get_doc_before_save():
-				error_extra = _("File saved in local filesystem.")
-				frappe.log_error(f"{error_msg} {error_extra}: {self.file_name}")
-				self.dfp_external_storage_s3_key = ""
-				self.dfp_external_storage = ""
-				self.file_url = original_file_url
-			# If modifing existent file throw error
-			else:
-				frappe.throw(error_msg)
+			if uploaded_to_remote:
+				try:
+					self.dfp_external_storage_client.remove_object(
+						bucket_name=self.dfp_external_storage_doc.bucket_name,
+						object_name=key)
+				except Exception:
+					frappe.log_error(f"Failed to rollback remote file after error: {key}")
+			self.dfp_external_storage_s3_key = ""
+			self.dfp_external_storage = ""
+			self.file_url = original_file_url
+			frappe.throw(error_msg)
 
 	def dfp_external_storage_delete_file(self):
 		if not self.dfp_is_s3_remote_file():
